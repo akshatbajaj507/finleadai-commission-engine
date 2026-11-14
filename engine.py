@@ -48,7 +48,7 @@ def parse_assumptions(rows: Iterable[dict[str, Any]]) -> dict[str, float]:
     settings = {}
     for row in rows:
         key = str(row.get("Key", "")).strip()
-        if key and key != "nan":
+        if key and key.lower() not in ("nan", "note", "notes"):
             if key in settings:
                 raise ModelInputError(f"Duplicate assumption: {key}")
             settings[key] = _number(row.get("Value"), key)
