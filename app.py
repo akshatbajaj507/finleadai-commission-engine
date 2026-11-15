@@ -1,11 +1,12 @@
 """Streamlit demo: upload the sample Excel workbook or use the bundled sample."""
 from pathlib import Path
 from io import BytesIO
+from hashlib import sha256
 
 import pandas as pd
 import streamlit as st
 
-from engine import ModelInputError, build_recommendations, parse_assumptions, simulate_deal, rebalance_portfolio
+from engine import ModelInputError, build_recommendations, parse_assumptions, simulate_deal, rebalance_portfolio, rebalance_deal_portfolio, rebalance_multiple_cohorts
 
 st.set_page_config(page_title="Commission Underwriting | Demo", page_icon="🧮", layout="wide")
 
@@ -63,6 +64,11 @@ except (ModelInputError, ValueError, KeyError, ImportError) as exc:
     st.error(f"Input validation failed: {exc}")
     st.stop()
 
+# Invalidate a transferred proposal when the source data or market setting changes.
+workbook_signature = sha256(blob + market_target.encode("utf-8")).hexdigest()
+if st.session_state.get("deal_transfer") and st.session_state["deal_transfer"].get("signature") != workbook_signature:
+    st.session_state.pop("deal_transfer", None)
+
 all_results = pd.DataFrame(result_rows)
 product_options = sorted(all_results["Product"].unique())
 selected_products = st.multiselect("Filter products", product_options, default=product_options)
@@ -71,9 +77,15 @@ if filtered.empty:
     st.warning("Select at least one product to show results.")
     st.stop()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Portfolio overview", "Deal simulator", "Portfolio rebalancing", "Calculation methodology", "Input data"])
+# Use a stateful page selector rather than st.tabs so the Deal Simulator button
+# can navigate directly to Portfolio Rebalancing.
+PAGES = ["Portfolio overview", "Deal simulator", "Portfolio rebalancing", "Calculation methodology", "Input data"]
+if "active_page" not in st.session_state or st.session_state["active_page"] not in PAGES:
+    st.session_state["active_page"] = PAGES[0]
+active_page = st.radio("Application section", PAGES, key="active_page", horizontal=True, label_visibility="collapsed")
 
-with tab1:
+
+if active_page == "Portfolio overview":
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Cohorts", len(filtered))
     c2.metric("Market-aligned", int((filtered["Status"] == "Market aligned").sum()))
@@ -90,7 +102,7 @@ with tab1:
     st.download_button("Export all results (CSV)", all_results.to_csv(index=False).encode("utf-8-sig"),
                        file_name="commission_recommendations.csv", mime="text/csv")
 
-with tab2:
+if active_page == "Deal simulator":
     st.subheader("Underwriter deal desk")
     selected_id = st.selectbox("Cohort", filtered["Cohort_ID"].tolist())
     row = filtered.loc[filtered["Cohort_ID"] == selected_id].iloc[0].to_dict()
@@ -128,60 +140,164 @@ with tab2:
     st.markdown("**Recommendation rationale**")
     st.write(f"Market target: {pct(row['Market_Target_Pct'])}; adjusted max affordable: {pct(custom_cap)}; deal recommendation: {pct(custom_recommendation)}.")
     st.write(f"Calculation: 100% − adjusted SLR {pct(adjusted_slr)} − expenses {pct(assumptions['expense_ratio'])} − other costs {pct(assumptions['other_cost_ratio'])} − extra deal costs {extra_cost_pct:.1f}% − commission {pct(rate_input)} = expected margin {pct(simulation['expected_margin'])}.")
+    st.divider()
+    st.markdown("### Continue to portfolio rebalancing")
+    st.caption("Transfer this *additional deal* with its actual deal premium, SLR adjustment, extra costs and proposed commission. Existing cohort volumes remain unchanged. The new deal is compared against its own recommended commission before offsets are suggested.")
+    def send_deal_to_rebalancing():
+        st.session_state["deal_transfer"] = {
+            "signature": workbook_signature,
+            "cohort_id": selected_id,
+            "deal_premium": float(premium),
+            "slr_adjustment_pp": float(slr_stress_pp),
+            "adjusted_slr": float(adjusted_slr),
+            "extra_cost_ratio": float(extra_cost_pct / 100),
+            "recommended_rate": float(custom_recommendation),
+            "proposed_rate": float(rate_input),
+        }
+        st.session_state["active_page"] = "Portfolio rebalancing"
+    st.button("Send to Portfolio Rebalancing →", type="primary", on_click=send_deal_to_rebalancing)
 
 
-with tab3:
-    st.subheader("Underwriter discretion & portfolio rebalancing")
-    st.write("Override the commission for one cohort. The engine proposes reductions in other cohorts to protect portfolio-wide expected profitability, weighted by written premium.")
-    st.info("This simulation applies to the **entire uploaded portfolio**, regardless of the product filter above. It assumes unchanged premium volumes and SLRs.")
-    choose = st.selectbox("Cohort to override", all_results["Cohort_ID"].tolist(), key="rebalance_cohort")
-    chosen = all_results.set_index("Cohort_ID").loc[choose]
-    first, second, third = st.columns(3)
-    with first:
-        st.metric("Current commission", pct(chosen["Recommended_Pct"]))
-        st.metric("Market benchmark", pct(chosen["Market_Target_Pct"]))
-    with second:
-        discretionary_rate = st.number_input("Your proposed commission (%)", min_value=0.0, max_value=100.0,
-                                             value=float(round(chosen["Recommended_Pct"] * 100, 2)), step=0.25,
-                                             key="portfolio_override") / 100
-        preserve = st.radio("Protect", ["Current portfolio profit (₹)", "Minimum target portfolio margin"],
-                            index=0, help="Current profit preserves the baseline expected contribution in rupees. The minimum target option permits use of existing headroom.")
-    with third:
-        market_floor = st.checkbox("Respect market minimum for offset cohorts", value=True,
-                                   help="Never reduce another cohort below its lowest market quote. Cohorts already below the minimum cannot be reduced further.")
-        st.caption("Turning this off permits cuts down to 0%, which may make affected cohorts uncompetitive.")
-    plan = rebalance_portfolio(
-        all_results.to_dict("records"), choose, discretionary_rate, assumptions,
-        preserve="baseline" if preserve.startswith("Current") else "target_margin",
-        floor_policy="market_floor" if market_floor else "zero",
+if active_page == "Portfolio rebalancing":
+    st.subheader("Multi-cohort underwriting & overall portfolio rebalancing")
+    st.write("Edit as many cohort commissions as you want in the table. Your changes are **locked**, and the engine finds suggested offsets only in cohorts you have not edited.")
+    st.info("The rebalancing calculation uses the **entire portfolio**, regardless of the product filter above. Premium volume and expected SLR are held constant for existing cohorts.")
+
+    # Reset the editable table if the workbook or market benchmark changes.
+    if st.session_state.get("multi_editor_signature") != workbook_signature:
+        st.session_state["multi_editor_signature"] = workbook_signature
+        st.session_state.pop("multi_commission_editor", None)
+
+    editor_input = all_results[["Cohort_ID", "Product", "Risk_Tier", "Written_Premium_INR", "Expected_SLR",
+                               "Market_Min_Pct", "Market_Target_Pct", "Recommended_Pct"]].copy()
+    editor_input["Current commission %"] = (editor_input["Recommended_Pct"] * 100).round(4)
+    editor_input["Underwriter commission %"] = editor_input["Current commission %"]
+    editor_input["Market floor %"] = (editor_input["Market_Min_Pct"] * 100).round(3)
+    editor_input["Market target %"] = (editor_input["Market_Target_Pct"] * 100).round(3)
+    editor_input["SLR %"] = (editor_input["Expected_SLR"] * 100).round(3)
+    editor_input = editor_input[["Cohort_ID", "Product", "Risk_Tier", "Written_Premium_INR",
+                                 "SLR %", "Market floor %", "Market target %",
+                                 "Current commission %", "Underwriter commission %"]]
+    st.markdown("#### 1. Enter discretion across multiple cohorts")
+    st.caption("Double-click cells in **Underwriter commission %** to change them. Values are percentages (e.g., enter 12.5 for 12.5%). Every changed row is protected from automatic offsets. Use the reset button to clear all discretion.")
+    left, right = st.columns([4, 1])
+    with right:
+        if st.button("Reset all changes", use_container_width=True):
+            st.session_state.pop("multi_commission_editor", None)
+            st.session_state.pop("deal_transfer", None)
+            st.rerun()
+    edited = st.data_editor(
+        editor_input, key="multi_commission_editor", hide_index=True, use_container_width=True,
+        num_rows="fixed", disabled=[c for c in editor_input.columns if c != "Underwriter commission %"],
+        column_config={
+            "Cohort_ID": st.column_config.TextColumn("Cohort ID"),
+            "Written_Premium_INR": st.column_config.NumberColumn("Premium (₹)", format="₹ %.0f"),
+            "Underwriter commission %": st.column_config.NumberColumn("Underwriter commission %", min_value=0.0, max_value=100.0, step=0.25, format="%.2f"),
+            "Current commission %": st.column_config.NumberColumn("Baseline commission %", format="%.2f"),
+        },
     )
-    a,b,c,d = st.columns(4)
-    a.metric("Original portfolio margin", pct(plan["baseline_margin"]))
-    b.metric("Rebalanced margin", pct(plan["after_margin"]), delta=f"{(plan['after_margin']-plan['baseline_margin'])*100:+.2f} pp")
-    c.metric("Override cost / savings", inr(plan["override_cost_inr"]))
-    d.metric("Other cohorts adjusted", plan["adjusted_count"])
-    if discretionary_rate > assumptions["max_commission_rate"] + 1e-9:
-        st.warning("The selected cohort override exceeds the policy commission cap. Approval required even if portfolio margin is protected.")
-    if plan["feasible"]:
-        st.success(f"Portfolio profitability constraint satisfied. Expected portfolio profit: {inr(plan['after_profit_inr'])}; required: {inr(plan['target_profit_inr'])}.")
-    else:
-        st.error(f"No feasible rebalancing under these constraints. Unfunded expected profit shortfall: {inr(plan['unfunded_inr'])}. Consider reducing the override, relaxing market floors with approval, or repricing.")
-    if not market_floor:
-        st.warning("Market floors have been relaxed. Review commercial competitiveness of every suggested cut.")
-    st.caption(f"Estimated offset needed: {inr(plan['needed_offset_inr'])} · Available offset capacity: {inr(plan['available_offset_inr'])} · Profit before override: {inr(plan['baseline_profit_inr'])} · Profit after override before offsets: {inr(plan['post_override_profit_inr'])}")
-    plan_df = pd.DataFrame(plan["rows"])
-    view = ["Cohort_ID", "Product", "Risk_Tier", "Written_Premium_INR", "Market_Min_Pct", "Baseline_Pct", "Rebalanced_Pct", "Delta_Points", "Commission_Change_INR", "Margin_Before_Pct", "Margin_After_Pct", "Note"]
-    st.dataframe(plan_df[view].style.format({"Written_Premium_INR":"₹{:,.0f}", "Commission_Change_INR":"₹{:,.0f}",
-        "Market_Min_Pct":"{:.1%}", "Baseline_Pct":"{:.2%}", "Rebalanced_Pct":"{:.2%}",
-        "Margin_Before_Pct":"{:.2%}", "Margin_After_Pct":"{:.2%}", "Delta_Points":"{:+.2f}"}),
-        use_container_width=True, hide_index=True)
-    st.subheader("Commission changes by cohort (percentage points)")
-    st.bar_chart(plan_df.set_index("Cohort_ID")["Delta_Points"])
-    st.download_button("Download rebalancing proposal (CSV)", plan_df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="underwriter_rebalancing_proposal.csv", mime="text/csv")
-    st.caption("Demonstration heuristic: prioritise offsets in cohorts with the most room above market minimum, then larger premium volume. Overrides are proposals requiring underwriting approval. No new business response, capital cost or forecast uncertainty is included.")
+    overrides = {}
+    invalid = []
+    for _, r in edited.iterrows():
+        proposed = r["Underwriter commission %"]
+        if pd.isna(proposed) or not 0 <= float(proposed) <= 100:
+            invalid.append(str(r["Cohort_ID"]))
+        elif abs(float(proposed) - float(r["Current commission %"])) > 0.00001:
+            overrides[str(r["Cohort_ID"])] = float(proposed) / 100
+    if invalid:
+        st.error(f"Enter valid commission percentages between 0 and 100 for: {', '.join(invalid)}")
+        st.stop()
 
-with tab4:
+    transfer = st.session_state.get("deal_transfer")
+    if transfer:
+        st.success(f"Additional deal transferred from Deal Simulator: cohort {transfer['cohort_id']}, premium {inr(transfer['deal_premium'])}, SLR {pct(transfer['adjusted_slr'])}, proposed {pct(transfer['proposed_rate'])}.")
+        st.caption("The transferred deal is incremental and locked. You can simultaneously change commission in existing cohorts in the table above.")
+        if st.button("Remove transferred deal (keep cohort edits)"):
+            st.session_state.pop("deal_transfer", None)
+            st.rerun()
+    st.write(f"**Discretion applied to {len(overrides)} existing cohort(s)**" + (" + 1 additional deal" if transfer else ""))
+
+    st.markdown("#### 2. Choose portfolio protection rules")
+    c1, c2 = st.columns(2)
+    with c1:
+        preserve = st.radio("Protect", ["Current portfolio profit (₹)", "Minimum target portfolio margin"], index=0,
+                            help="The first preserves profit including the transferred deal at its recommended commission. The second protects the portfolio-level target margin.")
+    with c2:
+        market_floor = st.checkbox("Protect market floors for suggested offsets", value=True,
+                                   help="Automatic cuts cannot go below the lowest observed market quote. Existing cohorts already below their market minimum get no additional automatic reductions.")
+    options = {"preserve": "baseline" if preserve.startswith("Current") else "target_margin",
+               "floor_policy": "market_floor" if market_floor else "zero"}
+    try:
+        plan = rebalance_multiple_cohorts(
+            all_results.to_dict("records"), overrides, assumptions,
+            deal=transfer, **options,
+        )
+    except (ModelInputError, ValueError) as exc:
+        st.error(f"Cannot calculate rebalancing: {exc}")
+        st.stop()
+
+    st.markdown("#### 3. Overall portfolio profitability")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Baseline profit", inr(plan["baseline_profit_inr"]))
+    k2.metric("Profit after discretionary edits", inr(plan["post_override_profit_inr"]),
+              delta=inr(plan["post_override_profit_inr"] - plan["baseline_profit_inr"]))
+    k3.metric("Profit after rebalancing", inr(plan["after_profit_inr"]),
+              delta=inr(plan["after_profit_inr"] - plan["baseline_profit_inr"]))
+    k4.metric("Unfunded profit gap", inr(plan["unfunded_inr"]))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Baseline portfolio margin", pct(plan["baseline_margin"]))
+    m2.metric("Margin after overrides", pct(plan["post_override_margin"]))
+    m3.metric("Final portfolio margin", pct(plan["after_margin"]),
+              delta=f"{(plan['after_margin']-plan['baseline_margin'])*100:+.2f} pp")
+    m4.metric("Premium considered", inr(plan["total_premium_inr"]))
+
+    if plan["feasible"]:
+        st.success("Portfolio profitability constraint is satisfied with the suggested offsets.")
+    else:
+        st.error(f"Insufficient available offsets: {inr(plan['unfunded_inr'])} expected profit shortfall remains. Reduce discretionary rates or revise constraints with approval.")
+    policy_issues = [r for r in plan["rows"] if r["Locked"] and
+        (r["Rebalanced_Pct"] > assumptions["max_commission_rate"] + 1e-9 or
+         r["Rebalanced_Pct"] < r["Market_Min_Pct"] - 1e-9 or
+         r["Margin_After_Pct"] < assumptions["target_profit_margin"] - 1e-9)]
+    if policy_issues:
+        st.warning(f"{len(policy_issues)} locked proposal(s) have cohort-level policy/market/profitability exceptions. Portfolio feasibility is not individual-cohort approval.")
+    if not market_floor:
+        st.warning("Market floor protection is OFF. The offsets may be commercially uncompetitive.")
+
+    st.markdown("#### 4. Where the money moves")
+    bridge = pd.DataFrame({
+        "Stage": ["Baseline", "After discretionary changes", "After suggested offsets", "Required profit"],
+        "Expected profit (₹)": [plan["baseline_profit_inr"], plan["post_override_profit_inr"],
+                                plan["after_profit_inr"], plan["target_profit_inr"]],
+    }).set_index("Stage")
+    st.bar_chart(bridge)
+    cost1, cost2, cost3, cost4 = st.columns(4)
+    cost1.metric("Increased discretionary payouts", inr(plan["gross_extra_cost_inr"]))
+    cost2.metric("Savings from discretionary cuts", inr(plan["gross_discretionary_savings_inr"]))
+    cost3.metric("Automatic offset savings", inr(plan["suggested_savings_inr"]))
+    cost4.metric("Automatic offset capacity", inr(plan["available_offset_inr"]))
+
+    st.markdown("#### 5. Complete cohort-by-cohort impact")
+    plan_df = pd.DataFrame(plan["rows"])
+    if transfer and plan["deal_row_id"]:
+        plan_df.loc[plan_df["Cohort_ID"] == plan["deal_row_id"], "Cohort_ID"] = f"New deal ({transfer['cohort_id']})"
+    breakdown = plan_df[["Cohort_ID", "Row_Type", "Product", "Written_Premium_INR", "Baseline_Pct",
+                         "Discretionary_Pct", "Rebalanced_Pct", "Delta_Points", "Commission_Change_INR",
+                         "Profit_Change_INR", "Margin_Before_Pct", "Margin_After_Pct", "Note"]]
+    st.dataframe(breakdown.style.format({
+        "Written_Premium_INR": "₹{:,.0f}", "Commission_Change_INR": "₹{:,.0f}",
+        "Profit_Change_INR": "₹{:,.0f}", "Baseline_Pct": "{:.2%}",
+        "Discretionary_Pct": "{:.2%}", "Rebalanced_Pct": "{:.2%}",
+        "Margin_Before_Pct": "{:.2%}", "Margin_After_Pct": "{:.2%}", "Delta_Points": "{:+.2f}",
+    }), use_container_width=True, hide_index=True)
+    st.subheader("Commission movement by cohort (percentage points)")
+    st.bar_chart(plan_df.set_index("Cohort_ID")["Delta_Points"])
+    st.download_button("Download complete portfolio rebalancing CSV", plan_df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="finleadai_multi_cohort_rebalancing.csv", mime="text/csv")
+    st.caption("This is a transparent greedy reallocation, not optimal economic pricing. Manually modified rates remain locked. It assumes unchanged premium volume and SLR, and does not model partner retention, demand response or future claims uncertainty.")
+
+
+if active_page == "Calculation methodology":
     st.subheader("Transparent rule set")
     st.latex(r"C_{\max}=\max(0,\min(C_{\text{cap}},1-\mathrm{SLR}-E-O-P))")
     st.latex(r"C_{\text{recommended}}=\min(C_{\text{market target}},C_{\max})")
@@ -189,7 +305,7 @@ with tab4:
     st.json({key: value for key, value in assumptions.items()})
     st.caption("This is a deterministic, illustrative margin-on-premium model. It does not adjust for inflation, reinsurance, capital cost, taxes, acquisition effects, credibility smoothing, or demand elasticity.")
 
-with tab5:
+if active_page == "Input data":
     st.subheader("Uploaded workbook")
     chosen_sheet = st.selectbox("Sheet", list(sheets))
     st.dataframe(sheets[chosen_sheet], use_container_width=True, hide_index=True)

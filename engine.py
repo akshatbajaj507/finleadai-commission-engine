@@ -236,7 +236,8 @@ def rebalance_portfolio(
         rate = _fraction(c["Recommended_Pct"], f"{cid} recommended rate")
         slr = _fraction(c["Expected_SLR"], f"{cid} SLR")
         market_low = _fraction(c["Market_Min_Pct"], f"{cid} market minimum")
-        margin_before = 1 - slr - assumptions["expense_ratio"] - assumptions["other_cost_ratio"] - rate
+        extra_cost = _fraction(c.get("Extra_Cost_Pct", 0.0), f"{cid} extra costs")
+        margin_before = 1 - slr - assumptions["expense_ratio"] - assumptions["other_cost_ratio"] - extra_cost - rate
         total_premium += premium
         baseline_profit += margin_before * premium
         rows.append({
@@ -249,6 +250,7 @@ def rebalance_portfolio(
             "Baseline_Pct": rate,
             "Rebalanced_Pct": override if cid == selected_id else rate,
             "Expected_SLR": slr,
+            "Extra_Cost_Pct": extra_cost,
             "Margin_Before_Pct": margin_before,
             "Note": "Underwriter override" if cid == selected_id else "Unchanged",
         })
@@ -312,4 +314,195 @@ def rebalance_portfolio(
         "unfunded_inr": max(0.0, target_profit - after_profit),
         "feasible": feasible,
         "adjusted_count": sum(r["Note"].startswith("Suggested offset") for r in rows),
+    }
+
+
+def rebalance_deal_portfolio(
+    cohorts: list[dict[str, Any]],
+    source_cohort_id: str,
+    deal_premium_inr: float,
+    adjusted_slr: float,
+    extra_cost_ratio: float,
+    recommended_deal_rate: float,
+    proposed_deal_rate: float,
+    assumptions: dict[str, float],
+    preserve: str = "baseline",
+    floor_policy: str = "market_floor",
+) -> dict[str, Any]:
+    """Rebalance an *additional* simulated deal alongside the existing portfolio.
+
+    Baseline assumes the new deal is written at its own recommendation.
+    Offsets may be proposed against existing cohort books, including the
+    originating cohort, but never against the simulated deal itself.
+    Existing cohort written premium is not replaced by deal premium.
+    """
+    source = next((c for c in cohorts if str(c["Cohort_ID"]) == source_cohort_id), None)
+    if source is None:
+        raise ModelInputError("Deal source cohort not found in portfolio")
+    premium = _number(deal_premium_inr, "Deal premium")
+    if premium <= 0:
+        raise ModelInputError("Deal premium must be positive")
+    slr = _fraction(adjusted_slr, "Deal adjusted SLR")
+    extra = _fraction(extra_cost_ratio, "Deal additional costs")
+    base = _fraction(recommended_deal_rate, "Deal recommended commission")
+    override = _fraction(proposed_deal_rate, "Deal proposed commission")
+    synthetic_id = "__SIMULATED_NEW_DEAL__"
+    if any(str(c["Cohort_ID"]) == synthetic_id for c in cohorts):
+        raise ModelInputError("Reserved deal identifier already exists")
+    deal_row = dict(source)
+    deal_row.update({
+        "Cohort_ID": synthetic_id,
+        "Product": f"New deal ({source_cohort_id})",
+        "Written_Premium_INR": premium,
+        "Expected_SLR": slr,
+        "Extra_Cost_Pct": extra,
+        "Recommended_Pct": base,
+    })
+    result = rebalance_portfolio(
+        [*cohorts, deal_row], synthetic_id, override, assumptions,
+        preserve=preserve, floor_policy=floor_policy,
+    )
+    result["deal_row_id"] = synthetic_id
+    result["source_cohort_id"] = source_cohort_id
+    result["existing_portfolio_premium_inr"] = sum(
+        _number(c["Written_Premium_INR"], "Cohort premium") for c in cohorts
+    )
+    return result
+
+
+def rebalance_multiple_cohorts(
+    cohorts: list[dict[str, Any]],
+    overrides: dict[str, float],
+    assumptions: dict[str, float],
+    preserve: str = "baseline",
+    floor_policy: str = "market_floor",
+    deal: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply multiple locked discretionary rates, then allocate offsets on unlocked cohorts.
+
+    `deal`, if supplied, represents incremental premium, not an override on
+    the existing source cohort. Its commission is locked. The baseline includes
+    that new deal at its recommended rate; all other baselines are unchanged.
+    No demand/retention response is modelled. Any manually set rate (up or down)
+    is respected, even if it breaches a policy or market boundary; flagged later.
+    """
+    if preserve not in ("baseline", "target_margin"):
+        raise ModelInputError("preserve must be baseline or target_margin")
+    if floor_policy not in ("market_floor", "zero"):
+        raise ModelInputError("floor_policy must be market_floor or zero")
+    if not cohorts:
+        raise ModelInputError("Portfolio cannot be empty")
+    ids = [str(c["Cohort_ID"]) for c in cohorts]
+    if len(ids) != len(set(ids)):
+        raise ModelInputError("Duplicate cohort IDs in portfolio")
+    if set(overrides) - set(ids):
+        raise ModelInputError(f"Unknown cohort override(s): {', '.join(sorted(set(overrides)-set(ids)))}")
+    rows = []
+    total_premium = baseline_profit = 0.0
+    for c in cohorts:
+        cid = str(c["Cohort_ID"])
+        premium = _number(c["Written_Premium_INR"], f"{cid} premium")
+        if premium <= 0:
+            raise ModelInputError(f"{cid}: premium must be positive")
+        slr = _fraction(c["Expected_SLR"], f"{cid} SLR")
+        base = _fraction(c["Recommended_Pct"], f"{cid} recommended rate")
+        market_low = _fraction(c["Market_Min_Pct"], f"{cid} market minimum")
+        extra = _fraction(c.get("Extra_Cost_Pct", 0), f"{cid} extra cost")
+        proposed = _fraction(overrides[cid], f"{cid} discretionary commission") if cid in overrides else base
+        before = 1 - slr - assumptions["expense_ratio"] - assumptions["other_cost_ratio"] - extra - base
+        rows.append({
+            "Cohort_ID": cid, "Product": c.get("Product", ""), "Risk_Tier": c.get("Risk_Tier", ""),
+            "Written_Premium_INR": premium, "Expected_SLR": slr, "Extra_Cost_Pct": extra,
+            "Market_Min_Pct": market_low, "Market_Target_Pct": c.get("Market_Target_Pct", base),
+            "Baseline_Pct": base, "Discretionary_Pct": proposed,
+            "Rebalanced_Pct": proposed, "Margin_Before_Pct": before,
+            "Locked": cid in overrides, "Row_Type": "Existing cohort",
+            "Note": "Underwriter override (locked)" if cid in overrides else "Unchanged",
+        })
+        total_premium += premium
+        baseline_profit += premium * before
+    deal_row_id = None
+    if deal is not None:
+        source_id = str(deal.get("cohort_id", ""))
+        source = next((c for c in cohorts if str(c["Cohort_ID"]) == source_id), None)
+        if source is None:
+            raise ModelInputError("Transferred deal source cohort not present")
+        deal_row_id = "__SIMULATED_NEW_DEAL__"
+        if deal_row_id in ids:
+            raise ModelInputError("Reserved deal ID conflicts with portfolio")
+        premium = _number(deal["deal_premium"], "Transferred deal premium")
+        if premium <= 0:
+            raise ModelInputError("Transferred deal premium must be positive")
+        slr = _fraction(deal["adjusted_slr"], "Transferred deal SLR")
+        extra = _fraction(deal["extra_cost_ratio"], "Transferred deal extra cost")
+        base = _fraction(deal["recommended_rate"], "Transferred deal recommended rate")
+        proposed = _fraction(deal["proposed_rate"], "Transferred deal proposed rate")
+        before = 1 - slr - assumptions["expense_ratio"] - assumptions["other_cost_ratio"] - extra - base
+        rows.append({
+            "Cohort_ID": deal_row_id, "Product": f"New deal ({source_id})", "Risk_Tier": source.get("Risk_Tier", ""),
+            "Written_Premium_INR": premium, "Expected_SLR": slr, "Extra_Cost_Pct": extra,
+            "Market_Min_Pct": _fraction(source["Market_Min_Pct"], "Deal source market minimum"),
+            "Market_Target_Pct": source.get("Market_Target_Pct", base),
+            "Baseline_Pct": base, "Discretionary_Pct": proposed, "Rebalanced_Pct": proposed,
+            "Margin_Before_Pct": before, "Locked": True, "Row_Type": "Additional deal",
+            "Note": "Transferred deal (locked)",
+        })
+        total_premium += premium
+        baseline_profit += premium * before
+    post_override_profit = baseline_profit - sum(
+        r["Written_Premium_INR"] * (r["Rebalanced_Pct"] - r["Baseline_Pct"]) for r in rows
+    )
+    required_profit = (baseline_profit if preserve == "baseline" else
+                       assumptions["target_profit_margin"] * total_premium)
+    needed = max(0.0, required_profit - post_override_profit)
+    candidates = []
+    for r in rows:
+        if r["Locked"]:
+            continue
+        floor = min(r["Baseline_Pct"], r["Market_Min_Pct"]) if floor_policy == "market_floor" else 0.0
+        room = max(0.0, r["Rebalanced_Pct"] - floor)
+        candidates.append((room, r["Written_Premium_INR"], r))
+    candidates.sort(key=lambda x: (-x[0], -x[1], x[2]["Cohort_ID"]))
+    available = sum(room * premium for room, premium, _ in candidates)
+    remaining = needed
+    for room, premium, r in candidates:
+        savings = min(remaining, room * premium)
+        if savings > 1e-7:
+            r["Rebalanced_Pct"] -= savings / premium
+            r["Note"] = "Suggested offset"
+            remaining -= savings
+        if remaining <= 1e-6:
+            break
+    after_profit = 0.0
+    for r in rows:
+        premium = r["Written_Premium_INR"]
+        r["Delta_Points"] = 100 * (r["Rebalanced_Pct"] - r["Baseline_Pct"])
+        r["Commission_Change_INR"] = premium * (r["Rebalanced_Pct"] - r["Baseline_Pct"])
+        r["Profit_Change_INR"] = -r["Commission_Change_INR"]
+        r["Margin_After_Pct"] = r["Margin_Before_Pct"] - (r["Rebalanced_Pct"] - r["Baseline_Pct"])
+        after_profit += premium * r["Margin_After_Pct"]
+        if r["Rebalanced_Pct"] + 1e-9 < r["Market_Min_Pct"]:
+            r["Note"] += "; below market floor"
+        if r["Rebalanced_Pct"] > assumptions["max_commission_rate"] + 1e-9:
+            r["Note"] += "; exceeds policy cap"
+        if r["Margin_After_Pct"] + 1e-9 < assumptions["target_profit_margin"]:
+            r["Note"] += "; below cohort profit target"
+    discretionary_cost = baseline_profit - post_override_profit
+    return {
+        "rows": rows, "baseline_profit_inr": baseline_profit,
+        "post_override_profit_inr": post_override_profit, "after_profit_inr": after_profit,
+        "target_profit_inr": required_profit, "total_premium_inr": total_premium,
+        "baseline_margin": baseline_profit / total_premium,
+        "post_override_margin": post_override_profit / total_premium,
+        "after_margin": after_profit / total_premium,
+        "override_cost_inr": discretionary_cost, "needed_offset_inr": needed,
+        "available_offset_inr": available,
+        "unfunded_inr": max(0.0, required_profit - after_profit),
+        "feasible": after_profit >= required_profit - 0.01,
+        "adjusted_count": sum(r["Note"].startswith("Suggested offset") for r in rows),
+        "locked_count": sum(r["Locked"] for r in rows),
+        "deal_row_id": deal_row_id,
+        "gross_extra_cost_inr": sum(max(0.0, r["Commission_Change_INR"]) for r in rows if r["Locked"]),
+        "gross_discretionary_savings_inr": -sum(min(0.0, r["Commission_Change_INR"]) for r in rows if r["Locked"]),
+        "suggested_savings_inr": -sum(r["Commission_Change_INR"] for r in rows if not r["Locked"]),
     }
