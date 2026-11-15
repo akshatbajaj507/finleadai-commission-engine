@@ -48,10 +48,22 @@ def parse_assumptions(rows: Iterable[dict[str, Any]]) -> dict[str, float]:
     settings = {}
     for row in rows:
         key = str(row.get("Key", "")).strip()
-        if key and key.lower() not in ("nan", "note", "notes"):
-            if key in settings:
-                raise ModelInputError(f"Duplicate assumption: {key}")
-            settings[key] = _number(row.get("Value"), key)
+        if not key or key.lower() == "nan":
+            continue
+
+        value = row.get("Value")
+        # Spreadsheet templates can include notes or section headings (e.g.
+        # a NOTE row with a blank Value). Pandas represents blank Excel cells
+        # as NaN, which is not a financial assumption. Skip these rows while
+        # still rejecting blanks for all REQUIRED assumptions.
+        is_blank = (value is None or
+                    (isinstance(value, (int, float)) and not math.isfinite(value)) or
+                    (isinstance(value, str) and not value.strip()))
+        if is_blank and key not in REQUIRED_ASSUMPTIONS:
+            continue
+        if key in settings:
+            raise ModelInputError(f"Duplicate assumption: {key}")
+        settings[key] = _number(value, key)
     for key in REQUIRED_ASSUMPTIONS:
         if key not in settings:
             raise ModelInputError(f"Missing assumption in Assumptions sheet: {key}")
@@ -186,4 +198,118 @@ def simulate_deal(
         "target_margin": assumptions["target_profit_margin"],
         "meets_profit_target": margin >= assumptions["target_profit_margin"] - 1e-9,
         "within_commission_cap": commission <= assumptions["max_commission_rate"] + 1e-9,
+    }
+
+
+def rebalance_portfolio(
+    cohorts: list[dict[str, Any]],
+    selected_id: str,
+    override_rate: float,
+    assumptions: dict[str, float],
+    preserve: str = "baseline",
+    floor_policy: str = "market_floor",
+) -> dict[str, Any]:
+    """Allocate a manual commission override across remaining cohorts.
+
+    The preserved quantity is expected aggregate profit in INR, not the
+    unweighted average of cohort margins. Premium volumes are held constant.
+    No demand response, SLR feedback, or risk correlation is modelled.
+    """
+    if preserve not in ("baseline", "target_margin"):
+        raise ModelInputError("preserve must be baseline or target_margin")
+    if floor_policy not in ("market_floor", "zero"):
+        raise ModelInputError("floor_policy must be market_floor or zero")
+    override = _fraction(override_rate, "Underwriter override")
+    ids = [str(c["Cohort_ID"]) for c in cohorts]
+    if len(ids) != len(set(ids)) or selected_id not in ids:
+        raise ModelInputError("Select a unique cohort present in the portfolio")
+    if not cohorts:
+        raise ModelInputError("Portfolio cannot be empty")
+    rows = []
+    total_premium = 0.0
+    baseline_profit = 0.0
+    for c in cohorts:
+        cid = str(c["Cohort_ID"])
+        premium = _number(c["Written_Premium_INR"], f"{cid} premium")
+        if premium <= 0:
+            raise ModelInputError(f"{cid} premium must be positive")
+        rate = _fraction(c["Recommended_Pct"], f"{cid} recommended rate")
+        slr = _fraction(c["Expected_SLR"], f"{cid} SLR")
+        market_low = _fraction(c["Market_Min_Pct"], f"{cid} market minimum")
+        margin_before = 1 - slr - assumptions["expense_ratio"] - assumptions["other_cost_ratio"] - rate
+        total_premium += premium
+        baseline_profit += margin_before * premium
+        rows.append({
+            "Cohort_ID": cid,
+            "Product": c.get("Product", ""),
+            "Risk_Tier": c.get("Risk_Tier", ""),
+            "Written_Premium_INR": premium,
+            "Market_Min_Pct": market_low,
+            "Market_Target_Pct": c["Market_Target_Pct"],
+            "Baseline_Pct": rate,
+            "Rebalanced_Pct": override if cid == selected_id else rate,
+            "Expected_SLR": slr,
+            "Margin_Before_Pct": margin_before,
+            "Note": "Underwriter override" if cid == selected_id else "Unchanged",
+        })
+    selected = next(r for r in rows if r["Cohort_ID"] == selected_id)
+    override_cost = (override - selected["Baseline_Pct"]) * selected["Written_Premium_INR"]
+    current_profit = baseline_profit - override_cost
+    target_profit = (baseline_profit if preserve == "baseline"
+                     else assumptions["target_profit_margin"] * total_premium)
+    gap = max(0.0, target_profit - current_profit)
+    # Do not reduce other cohorts unless the selected override creates a gap.
+    # Market floor mode never makes an already-below-market cohort worse.
+    candidates = []
+    for r in rows:
+        if r["Cohort_ID"] == selected_id:
+            continue
+        floor = (min(r["Baseline_Pct"], r["Market_Min_Pct"])
+                 if floor_policy == "market_floor" else 0.0)
+        room = max(0.0, r["Baseline_Pct"] - floor)
+        candidates.append((room, r["Written_Premium_INR"], r))
+    # Prefer cohorts with more commission headroom; use premium volume as
+    # tie-breaker. This is a transparent heuristic, not economic optimisation.
+    candidates.sort(key=lambda x: (-x[0], -x[1], x[2]["Cohort_ID"]))
+    total_capacity = sum(room * premium for room, premium, _ in candidates)
+    unmet = gap
+    for room, premium, r in candidates:
+        take = min(unmet, room * premium)
+        if take > 1e-7:
+            r["Rebalanced_Pct"] -= take / premium
+            r["Note"] = "Suggested offset"
+            unmet -= take
+        if unmet <= 1e-6:
+            unmet = 0.0
+            break
+    after_profit = 0.0
+    for r in rows:
+        p = r["Written_Premium_INR"]
+        r["Delta_Points"] = (r["Rebalanced_Pct"] - r["Baseline_Pct"]) * 100
+        r["Commission_Change_INR"] = p * (r["Rebalanced_Pct"] - r["Baseline_Pct"])
+        r["Margin_After_Pct"] = r["Margin_Before_Pct"] - (r["Rebalanced_Pct"] - r["Baseline_Pct"])
+        r["Profit_Change_INR"] = -r["Commission_Change_INR"]
+        after_profit += p * r["Margin_After_Pct"]
+        if r["Rebalanced_Pct"] < r["Market_Min_Pct"] - 1e-8:
+            r["Note"] += "; below market minimum"
+        if r["Rebalanced_Pct"] > assumptions["max_commission_rate"] + 1e-8:
+            r["Note"] += "; exceeds commission cap"
+        if r["Margin_After_Pct"] < assumptions["target_profit_margin"] - 1e-8:
+            r["Note"] += "; below cohort profit target"
+    feasible = after_profit >= target_profit - 0.01
+    return {
+        "rows": rows,
+        "baseline_profit_inr": baseline_profit,
+        "post_override_profit_inr": current_profit,
+        "after_profit_inr": after_profit,
+        "target_profit_inr": target_profit,
+        "total_premium_inr": total_premium,
+        "baseline_margin": baseline_profit / total_premium,
+        "after_margin": after_profit / total_premium,
+        "override_cost_inr": override_cost,
+        "needed_offset_inr": gap,
+        "available_offset_inr": total_capacity,
+        "unfunded_inr": max(0.0, target_profit - after_profit),
+        "feasible": feasible,
+        "adjusted_count": sum(r["Note"].startswith("Suggested offset") for r in rows),
     }
